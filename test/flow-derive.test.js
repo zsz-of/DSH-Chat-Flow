@@ -54,6 +54,11 @@ const {
   deriveFlow,
   todosOfToolCall,
   diffTodos,
+  SUMMARY_TOOL_NAME,
+  isSummaryMarkTool,
+  isSummaryMarkNode,
+  summaryMarkIndexOf,
+  trailingAnswerOf,
 } = exports.__internals
 
 /** 测试用的文案座位：与真实 `ctx.locale.bind` 同一套插值规则。 */
@@ -862,4 +867,121 @@ test('nodeRunsOf：最外层节点被剔除，并且切断相邻的过程块', (
     ],
     '插队消息本身不渲染在块里，但它让前后两块断开（用户发了消息 → 上一块结束）',
   )
+})
+
+/**
+ * 「总结命令」（`chat_flow_summary`）—— 用户 m00831 要求的分界标记。
+ *
+ * 纯函数层要证明三件事：标记认得出（含流式期未落定的那一次）、标记之后的节点归总结、
+ * 没有标记时旧行为一点没变（后者由整套既有用例兜住）。
+ */
+
+/** 总结标记调用的节点。`settled: false` 模拟流式期（工具还没返回）。 */
+function markNode(key, turn, step, settled = true) {
+  return settled
+    ? toolNode(key, turn, step, SUMMARY_TOOL_NAME, {}, { content: '已标记总结分界' })
+    : toolNode(key, turn, step, SUMMARY_TOOL_NAME, {})
+}
+
+test('总结标记：认得出调用，流式期未落定也认得出', () => {
+  assert.equal(summaryMarkIndexOf([userNode('u1', 1, 1, '干活'), markNode('m1', 1, 2)]), 1)
+  assert.equal(summaryMarkIndexOf([markNode('m2', 1, 1, false)]), 0, '调用还没落定也要认出来')
+  assert.equal(summaryMarkIndexOf([]), -1, '空序列不崩')
+  assert.equal(summaryMarkIndexOf(undefined), -1, '缺字段不崩')
+  assert.equal(
+    summaryMarkIndexOf([userNode('u1', 1, 1, '干活'), pwshNode('t1', 1, 1, 'echo a', 'a')]),
+    -1,
+    '别的工具调用不算标记',
+  )
+  assert.equal(isSummaryMarkTool('todo_write'), false)
+  assert.equal(isSummaryMarkTool(SUMMARY_TOOL_NAME), true)
+  assert.equal(isSummaryMarkNode(markNode('m3', 1, 1)), true)
+  assert.equal(isSummaryMarkNode(pwshNode('t1', 1, 1, 'echo a', 'a')), false)
+})
+
+test('总结标记：有任务列表时，标记之后的节点整段进 closing，标记自己不出现在任何地方', () => {
+  const group = deriveFlow(
+    makeSnapshot([
+      userNode('u1', 1, '干活'),
+      todoNode('p1', 1, 1, [{ content: '任务A', status: 'completed' }]),
+      pwshNode('t1', 1, 2, 'echo a', 'a'),
+      assistantNode('a1', 1, 3, [{ kind: 'text', text: '过程里的一句叙述' }]),
+      markNode('m1', 1, 4),
+      assistantNode('a2', 1, 5, [{ kind: 'text', text: '总结第一段' }]),
+      writeNode('w2', 1, 6, 'D:/tmp/a.txt'),
+      assistantNode('a3', 1, 7, [{ kind: 'text', text: '总结第二段' }]),
+      turnTailNode('tt1', 1, 8),
+    ]),
+  ).turns[0]
+
+  assert.equal(group.summaryMarked, true)
+  assert.deepEqual(group.closing.map((node) => node.key), ['a2', 'w2', 'a3'], '标记之后的全部节点都属于总结')
+  assert.deepEqual(group.segments[0].nodes.map((node) => node.key), ['t1', 'a1'], '过程那一半原样不动')
+  assert.equal(
+    group.segments.some((segment) => segment.nodes.some((node) => node.key === 'm1')),
+    false,
+    '标记节点不能留在过程里',
+  )
+  assert.equal(
+    group.closing.some((node) => node.key === 'm1') || group.planNodes.some((node) => node.key === 'm1'),
+    false,
+    '标记节点自己也不进总结、不进规划段（它只是一次协议声明）',
+  )
+  assert.deepEqual(group.footerNodes.map((node) => node.key), ['tt1'], '收尾节点照旧单独成组')
+})
+
+test('总结标记：没有任务列表时，散节点里也要把总结那段剔出去', () => {
+  const group = deriveFlow(
+    makeSnapshot([
+      userNode('u2', 2, '干活'),
+      pwshNode('t2', 2, 1, 'echo a', 'a'),
+      markNode('m2', 2, 2),
+      assistantNode('b1', 2, 3, [{ kind: 'text', text: '总结' }]),
+      turnTailNode('tt2', 2, 4),
+    ]),
+  ).turns[0]
+
+  assert.equal(group.planned, false)
+  assert.equal(group.summaryMarked, true)
+  assert.deepEqual(
+    group.looseNodes.map((node) => node.key),
+    ['t2', 'tt2'],
+    '过程那半不含标记与总结（收尾节点照旧留在散节点里，渲染层再把它剔除）',
+  )
+  assert.deepEqual(group.closing.map((node) => node.key), ['b1'])
+})
+
+test('总结标记：调了命令但还没写总结时不崩，也不会凭空造出总结', () => {
+  const group = deriveFlow(
+    makeSnapshot([userNode('u3', 3, '干活'), markNode('m3', 3, 1, false)]),
+  ).turns[0]
+  assert.equal(group.summaryMarked, true)
+  assert.deepEqual(group.closing, [])
+})
+
+test('总结标记：违反协议调了多次，只认第一次之后的内容，多出来的标记不渲染', () => {
+  const group = deriveFlow(
+    makeSnapshot([
+      userNode('u4', 4, '干活'),
+      markNode('m4a', 4, 1),
+      assistantNode('c1', 4, 2, [{ kind: 'text', text: '总结开头' }]),
+      markNode('m4b', 4, 3),
+      assistantNode('c2', 4, 4, [{ kind: 'text', text: '总结结尾' }]),
+    ]),
+  ).turns[0]
+
+  assert.deepEqual(group.closing.map((node) => node.key), ['c1', 'c2'], '第二次标记不产生第二段过程')
+})
+
+test('没有总结标记时行为不变：还是「最后一段正文」当收尾（旧启发式）', () => {
+  const nodes = [
+    userNode('u5', 5, '干活'),
+    todoNode('p5', 5, 1, [{ content: '任务A', status: 'in_progress' }]),
+    pwshNode('t5', 5, 2, 'echo a', 'a'),
+    assistantNode('d1', 5, 3, [{ kind: 'text', text: '做完了' }]),
+  ]
+  const group = deriveFlow(makeSnapshot(nodes)).turns[0]
+  assert.equal(group.summaryMarked, false)
+  assert.deepEqual(group.closing.map((node) => node.key), ['d1'])
+  assert.deepEqual(trailingAnswerOf(group.segments[0].nodes), [], '摘走之后分段里没有尾巴正文了')
 })

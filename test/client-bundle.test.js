@@ -10,6 +10,7 @@ import { test } from 'node:test'
 
 import { collectText, createStorage, loadBundle } from './helpers/load-bundle.mjs'
 import { createProbeReact } from './helpers/probe-react.mjs'
+import { SUMMARY_TOOL_NAME } from '../lib/protocol.js'
 import {
   assistantNode,
   blankAssistantNode,
@@ -21,6 +22,7 @@ import {
   subagentCallNode,
   systemPromptNode,
   todoNode,
+  toolNode,
   turnProcessNode,
   turnTailNode,
   userNode,
@@ -1985,4 +1987,99 @@ test('会话被删掉之后，它留下的键才被清掉（会话列表就是�
   assert.deepEqual(staleSessionIds(env, undefined), [])
   // 存储不可用时不抛错，只是这一轮清不了。
   assert.deepEqual(staleSessionIds({ localStorage: { length: 1, key: () => { throw new Error('x') } } }, new Set(['a'])), [])
+})
+
+/**
+ * 「总结命令」（用户 m00831）：host 注册工具、client 认标记，两半在两个包里各持一份字面量，
+ * 所以必须有一条接线测试把它们钉在一起——只改一边就会「模型调了工具但界面不认」。
+ */
+test('总结命令：host 与 client 两半的工具名必须一致', () => {
+  const { SUMMARY_TOOL_NAME: clientName, isSummaryMarkTool, summaryMarkIndexOf } = client.__internals
+  assert.equal(clientName, SUMMARY_TOOL_NAME, '客户端那份字面量必须与 host 的 protocol.js 一致')
+  assert.equal(isSummaryMarkTool(SUMMARY_TOOL_NAME), true)
+  assert.equal(isSummaryMarkTool('todo_write'), false, '别的工具名不能被当成标记')
+  const mark = toolNode('m1', 1, 1, SUMMARY_TOOL_NAME, {}, { content: '已标记总结分界' })
+  assert.equal(summaryMarkIndexOf([userNode('u1', 1, '干活'), mark]), 1)
+})
+
+test('总结命令：声明过分界时，总结整段在「任务过程」之外，且只有一份', () => {
+  const { view, t } = bootView()
+  const mark = toolNode('m1', 1, 3, SUMMARY_TOOL_NAME, {}, { content: '已标记总结分界：此后的输出视为本轮总结。' })
+  const nodes = [
+    userNode('u1', 1, '干活'),
+    todoNode('p1', 1, 1, [{ content: '任务A', status: 'completed' }]),
+    pwshNode('t1', 1, 2, 'echo a', 'a'),
+    mark,
+    // 标记之后的总结可能不止一段文字：中间还可能插一次工具调用（例如落盘、验证）。
+    // 「整段都在外面」是这条用例的关键——只把最后一个 inline run 拿出去会把它截成两半。
+    assistantNode('a2', 1, 4, [{ kind: 'text', text: '先交代一句' }]),
+    pwshNode('t2', 1, 5, 'echo b', 'b'),
+    assistantNode('a3', 1, 6, [{ kind: 'text', text: '这是总结正文' }]),
+    turnTailNode('tt1', 1, 7),
+  ]
+  const props = {
+    sessionId: 'session-summary-mark',
+    t,
+    useChat: (selector) => selector(makeSnapshot(nodes)),
+    useSession: () => ({ hasMore: false, loadingOlder: false, running: false }),
+  }
+  const tree = view.component(props)
+  const turn = findElement(tree, (element) => element.props?.className === 'dcf-turn')
+  assert.ok(turn !== undefined, '应渲染出回合容器')
+
+  const isSummaryLeaf = (element) =>
+    String(element.props?.className ?? '').includes('dcf-leaf') &&
+    /先交代一句|这是总结正文/.test(collectText(element))
+  // 这一条是本功能的**全部意义**：总结正文不在「任务过程」折叠体里，而且不能里外各画一份。
+  assert.deepEqual(foldDepthsOf(turn, isSummaryLeaf), [0, 0], '标记之后的每一段都在最外层，各渲染一次')
+  assert.match(collectText(turn), /任务过程/, '过程那一半照旧是折叠体')
+
+  // 标记调用自己是一次协议声明，不是一次操作：它的结果文本与卡片都不该出现。
+  assert.equal(
+    collectText(tree).includes('已标记总结分界'),
+    false,
+    '标记调用的结果不渲染（否则用户会在总结上方看到一张莫名其妙的卡）',
+  )
+})
+
+test('总结命令：跑动中也要立刻把总结拿出来，不等回合结束', () => {
+  const { view, t } = bootView()
+  const mark = toolNode('m1', 1, 3, SUMMARY_TOOL_NAME, {})
+  const props = {
+    sessionId: 'session-summary-live',
+    t,
+    useChat: (selector) =>
+      selector(
+        makeSnapshot([
+          userNode('u1', 1, '干活'),
+          todoNode('p1', 1, 1, [{ content: '任务A', status: 'in_progress' }]),
+          pwshNode('t1', 1, 2, 'echo a', 'a'),
+          mark,
+          assistantNode('a2', 1, 4, [{ kind: 'text', text: '这是总结正文' }]),
+        ]),
+      ),
+    useSession: () => ({ hasMore: false, loadingOlder: false, running: true }),
+  }
+  const tree = view.component(props)
+  const turn = findElement(tree, (element) => element.props?.className === 'dcf-turn')
+  assert.ok(turn !== undefined)
+  const isSummaryLeaf = (element) =>
+    String(element.props?.className ?? '').includes('dcf-leaf') &&
+    collectText(element).includes('这是总结正文')
+  assert.deepEqual(
+    foldDepthsOf(turn, isSummaryLeaf),
+    [0],
+    '模型刚声明分界、总结还在流式时就要显示在最外层（不然正文会消失几秒再出现）',
+  )
+  // 过程那一半照旧折着：分界只把**标记之后**的东西拿出去，不能顺手把过程也漏出来。
+  const processFold = findElement(
+    turn,
+    (element) => element.props?.className === 'dcf-fold' && collectText(element).includes('echo a'),
+  )
+  assert.ok(processFold !== undefined, '过程内容仍应折在折叠体里（跑动中默认展开）')
+  assert.equal(
+    collectText(processFold).includes('这是总结正文'),
+    false,
+    '同一个折叠体里不能出现总结正文（里外各画一份是明令禁止的）',
+  )
 })

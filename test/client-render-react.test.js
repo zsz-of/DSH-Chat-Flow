@@ -49,6 +49,7 @@ import {
   userNode,
   writeNode,
 } from './helpers/flow-fixtures.mjs'
+import { SUMMARY_TOOL_NAME } from '../lib/protocol.js'
 
 /** profile 的 `node_modules`：桌面壳实际使用的依赖版本都在这里。 */
 function profileNodeModules() {
@@ -449,4 +450,52 @@ test('SSR：原生座位在真实 React 下渲染，展开态与锚点属性都�
   assert.match(html, /data-chat-flow-kind="user"[^>]*data-chat-anchor-key="u1"/)
   assert.match(html, /data-chat-flow-kind="tool-call"[^>]*data-chat-anchor-key="t1"/)
   assert.match(html, /data-chat-turn="1"/)
+})
+
+/* ─────────────────────────── 「总结命令」划出的分界（真实 React） ─────────────────────────── */
+
+test('SSR：任务结束时总结正文渲染在「任务过程」折叠体之外，标记调用自己不渲染', (t) => {
+  if (!ready) return t.skip('缺少 profile 里的 react / react-dom')
+  const mark = toolNode('m1', 1, 3, SUMMARY_TOOL_NAME, {}, { content: '已标记总结分界：此后的输出视为本轮总结。' })
+  const html = render(
+    makeSnapshot([
+      userNode('u1', 1, '干活'),
+      todoNode('p1', 1, 1, [{ content: '任务A', status: 'completed' }]),
+      pwshNode('t1', 1, 2, 'echo a', 'a'),
+      mark,
+      assistantNode('a2', 1, 4, [{ kind: 'text', text: '这是总结正文' }]),
+      turnTailNode('tt1', 1, 5),
+    ]),
+    { sessionId: 'ssr-summary-mark', session: { running: false } },
+  )
+
+  assert.match(html, /任务过程/, '过程那一半照旧是折叠体')
+  // 「任务过程」是收起的，折叠体正文根本不在 DOM 里 —— 总结正文仍然出现，说明它在折叠体之外。
+  assert.match(html, /这是总结正文/, '总结是给用户看的结论，必须在最外层')
+  assert.equal(
+    html.includes('已标记总结分界'),
+    false,
+    '标记调用的结果不渲染（它只是一次协议声明）',
+  )
+})
+
+test('SSR：跑动中刚声明分界，总结正文就已经在外面（不等回合结束）', (t) => {
+  if (!ready) return t.skip('缺少 profile 里的 react / react-dom')
+  const html = render(
+    makeSnapshot([
+      userNode('u1', 1, '干活'),
+      todoNode('p1', 1, 1, [{ content: '任务A', status: 'in_progress' }]),
+      toolNode('m1', 1, 2, SUMMARY_TOOL_NAME, {}),
+      assistantNode('a2', 1, 3, [{ kind: 'text', text: '这是总结正文' }]),
+    ]),
+    { sessionId: 'ssr-summary-live', session: { running: true } },
+  )
+  assert.match(html, /这是总结正文/)
+  // 跑动中「任务过程」是展开的（`stageOpen = live === true`）：这一条只保证总结**已经**在树里
+  // 且只有一份（「在折叠体之外」由 client-bundle 的层深断言与上面那条收起态用例负责）。
+  assert.equal(
+    (html.match(/这是总结正文/g) ?? []).length,
+    1,
+    '总结正文只能渲染一份（里外各画一份是明令禁止的）',
+  )
 })
