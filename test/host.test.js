@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { before, test } from 'node:test'
 
-import { PROTOCOL_BUDGET } from '../lib/protocol.js'
+import { PROTOCOL_BUDGET, SUMMARY_TOOL_NAME } from '../lib/protocol.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PEER_LINK = join(HERE, '..', 'node_modules', '@deepseek-ai', 'dsh-llm')
@@ -27,7 +27,7 @@ before(async () => {
 
 /** 桩上下文：只实现本插件真正用到的那几个动词。 */
 function stubCtx() {
-  const captured = { handlers: new Map(), effects: [], sections: [] }
+  const captured = { handlers: new Map(), effects: [], sections: [], tools: [] }
   const ctx = {
     on(event, handler) {
       captured.handlers.set(event, handler)
@@ -39,17 +39,25 @@ function stubCtx() {
       return () => {}
     },
     inject(deps, run) {
-      // 与真实 cordis 一致：依赖齐全时才把补齐后的子上下文交给回调。
-      if (!deps.includes('systemPrompt')) return
-      run({
-        ...ctx,
-        systemPrompt: {
+      // 与真实 cordis 一致：**依赖齐全时**才把补齐后的子上下文交给回调。
+      const provided = { ...ctx }
+      if (deps.includes('systemPrompt')) {
+        provided.systemPrompt = {
           section(section) {
             captured.sections.push(section)
             return () => {}
           },
-        },
-      })
+        }
+      }
+      if (deps.includes('tools')) {
+        provided.tools = {
+          register(definition) {
+            captured.tools.push(definition)
+            return () => {}
+          },
+        }
+      }
+      if (deps.every((dep) => provided[dep] !== undefined)) run(provided)
     },
   }
   return { ctx, captured }
@@ -93,15 +101,45 @@ test('host 接线：注册一段命名唯一、顺序固定的系统提示分区
   assert.equal(section.name, 'chat-flow:protocol')
   assert.equal(Number.isFinite(section.order), true)
   // 协议必须写清四个时机与「先规划」，否则模型没有依据可循。
-  for (const phrase of ['任务开始时', '输出任务计划时', '需要用户审批或决定时', '任务结束时', 'todo_write', '禁止批量补记']) {
+  for (const phrase of ['任务开始时', '输出任务计划时', '需要审批或决定时', '任务结束时', 'todo_write', '禁止批量补记']) {
     assert.ok(section.text.includes(phrase), `协议正文缺少「${phrase}」`)
   }
+  // 「任务结束时先调总结命令」是这次新加的唯一硬要求：正文里必须点到它的**真名字**
+  // （改常量却忘了改正文，模型就会去调一个不存在的工具）。
+  assert.ok(
+    section.text.includes(SUMMARY_TOOL_NAME),
+    `协议正文必须点名总结命令 ${SUMMARY_TOOL_NAME}`,
+  )
   // ⚠️ 这段文字**每个模型请求都会进系统提示**（一个回合几十步就是几十次），所以长度要锁住：
   // 想加内容就得先删掉同量的内容，否则每次请求都在为它多付钱。
   assert.ok(
     section.text.length <= PROTOCOL_BUDGET,
     `协议正文 ${section.text.length} 字符，超出预算 ${PROTOCOL_BUDGET}——它每个请求都要付一次`,
   )
+})
+
+test('host 接线：注册「总结命令」工具（描述是模型唯一的调用依据）', async (t) => {
+  if (!ready) return t.skip('缺少 @deepseek-ai 链接')
+  const { ctx, captured } = stubCtx()
+  plugin.apply(ctx)
+  assert.equal(captured.tools.length, 1, '只注册总结命令这一个工具')
+  const tool = captured.tools[0]
+  assert.equal(tool.name, SUMMARY_TOOL_NAME)
+  // 描述是**模型可见**的自然语言：得说清「什么时候必须调」与「正文写在调用之后」。
+  assert.match(tool.description, /总结/)
+  assert.match(tool.description, /必须调用一次/)
+  // 它自己不产出正文，因此不需要任何参数；调用结果只是一个「已标记」的布尔。
+  assert.deepEqual(tool.parameters.properties, {})
+  assert.deepEqual(await tool.execute({}, {}), { marked: true })
+  assert.equal(typeof tool.presentCall, 'function', '调用要能在界面上显示成一张卡')
+  assert.equal(tool.presentCall({}).card, 'generic')
+})
+
+test('host 接线：工具注册与提示分区都在 effect 里（卸载时能一起收回）', (t) => {
+  if (!ready) return t.skip('缺少 @deepseek-ai 链接')
+  const { ctx, captured } = stubCtx()
+  plugin.apply(ctx)
+  assert.deepEqual(captured.effects, ['chat-flow prompt section', 'chat-flow summary tool'])
 })
 
 test('回合第一步注入规划提醒，且同一回合只注入一次', async (t) => {
